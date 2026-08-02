@@ -6,7 +6,7 @@
 
 **An educational LSM-tree storage engine implemented from scratch in C++20.**
 
-**Inspired by LevelDB's architecture; not API-compatible or file-format-compatible with LevelDB.**
+**Inspired by LevelDB's architecture.**
 
 A self-contained persistence stack: WAL, skip-list MemTable, SSTable, Bloom filters, sparse index, Block LRU cache, and multi-level Compaction — no third-party storage dependencies.
 

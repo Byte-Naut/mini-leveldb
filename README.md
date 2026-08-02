@@ -4,15 +4,18 @@
 
 # Mini-LevelDB
 
-**An LSM-Tree key-value storage engine built from scratch**
+**An educational LSM-tree storage engine implemented from scratch in C++20.**
 
-A complete, self-contained persistence stack in C++20: WAL, skip-list MemTable, SSTable, Bloom filters, sparse index, Block LRU cache, and multi-level Compaction — no third-party storage dependencies.
+**Inspired by LevelDB's architecture; not API-compatible or file-format-compatible with LevelDB.**
+
+A self-contained persistence stack: WAL, skip-list MemTable, SSTable, Bloom filters, sparse index, Block LRU cache, and multi-level Compaction — no third-party storage dependencies.
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](https://en.cppreference.com/w/cpp/20)
 [![CMake](https://img.shields.io/badge/CMake-3.28+-064F8C?logo=cmake&logoColor=white)](https://cmake.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL2-FCC624?logo=linux&logoColor=black)](#)
 [![Memory](https://img.shields.io/badge/Valgrind-0%20leaks-success)](#5-quality-assurance)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)](#6-quick-start)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 
@@ -33,7 +36,7 @@ A complete, self-contained persistence stack in C++20: WAL, skip-list MemTable, 
 
 ## 1. What This Is
 
-`Mini-LevelDB` is a **teaching-grade but engineering-quality** embedded key-value storage engine. The goal is to re-implement the **LSM-Tree (Log-Structured Merge Tree)** architecture behind Google LevelDB / RocksDB in modern C++ — from the ground up, without calling into any storage library.
+`Mini-LevelDB` is an **educational embedded key-value storage engine and systems programming reference implementation**. The goal is to re-implement the **LSM-Tree (Log-Structured Merge Tree)** architecture behind Google LevelDB / RocksDB in modern C++ — from the ground up, without calling into any storage library.
 
 Every layer is hand-written: WAL durability, skip-list MemTable, SSTable binary format, Bloom filters, sparse index, Block LRU cache, and background multi-level Compaction.
 
@@ -343,7 +346,7 @@ Honest accounting of current limitations — these are visible next steps, not h
 
 <div align="center">
 
-**Mini-LevelDB** · A complete LSM-Tree storage engine in modern C++
+**Mini-LevelDB** · An educational LSM-tree storage engine in modern C++
 
 If this project helped you understand how storage engines work, a Star ⭐ is appreciated.
 

@@ -165,19 +165,34 @@ These guarantees cover the tested process-crash scenarios. The implementation us
 
 These notes explain why the code is shaped the way it is, so the source is easier to follow.
 
-**Skip list for the MemTable.** A skip list sorts records by key and supports forward iteration, which is exactly what the SST flush needs: scan every record in order and write it out. A red-black tree would also work, but skip lists require less implementation machinery — no rotations, and insertion only needs to update a flat array of forward pointers. The level cap is 16 with a 0.25 promotion probability (`mem_table.h:73-74`), keeping average path length at about log₄(n). Nodes are allocated from a PMR monotonic arena rather than the heap, so the entire MemTable is freed in one call when the table is discarded after a flush.
+| Decision | Why |
+|---|---|
+| Skip list over red-black tree | Forward iteration is free; no rotations; nodes fit naturally in a PMR arena |
+| 56-bit seq + 8-bit type packed into one `uint64` | One integer comparison gives correct ordering — newer wins, put ≠ delete |
+| WAL held open for the whole session | Recovery stays a single linear replay with no branching; simplicity over bounded WAL size |
+| 4 KB MemTable flush threshold | Small enough that test datasets reliably exercise flush and compaction paths |
+| L0 linear scan, L1 binary search | L0 files can overlap (each flush is independent); L1 files are disjoint after compaction |
+| Full L0+L1 compaction only | Covering every file in those levels makes tombstone discard unconditionally safe |
+| No checksums, fsync, snapshots, or iterators | Omitting them keeps the core LSM flow legible without surrounding safety machinery |
 
-**Internal key format.** Every record stored in the skip list or an SST carries an internal key: the user key followed by a 64-bit pack value where the upper 56 bits hold the sequence number and the lower 8 bits hold the operation type (`mem_table.cpp:155`). A single integer comparison then orders records correctly — same user key sorts newer sequences first, and a put and a delete for the same key at the same sequence are distinct values. The sequence number is capped at 56 bits (`mini_kv_store.cpp:213`), giving 72 quadrillion operations before rollover.
+**Skip list for the MemTable.** A skip list sorts records by key and supports forward iteration, which is exactly what the SST flush needs: scan every record in order and write it out. A red-black tree would also work, but skip lists require less implementation machinery — no rotations, and insertion only needs to update a flat array of forward pointers. The level cap is 16 with a 0.25 promotion probability (see [mem_table.h lines 73–74](mem_table/includes/mem_table.h#L73-L74)), keeping average path length at about log₄(n). Nodes are allocated from a PMR monotonic arena rather than the heap, so the entire MemTable is freed in one call when the table is discarded after a flush.
 
-**WAL lifecycle.** The WAL stays open for the entire database session and is never rotated mid-session. On a clean close, the engine flushes all admitted data to SSTs, publishes the manifest, and truncates the WAL to zero. If the process crashes, recovery reads the WAL, replays every complete record into the active MemTable, and trims any incomplete tail before opening for writes (`mini_kv_store.cpp:26-61`). The trade-off is that a very long session accumulates a large WAL, but the recovery path stays simple: there is only one WAL and it either replays cleanly or gets trimmed.
+**Internal key format.** Every record stored in the skip list or an SST carries an internal key: the user key followed by a 64-bit pack value where the upper 56 bits hold the sequence number and the lower 8 bits hold the operation type (see [mem_table.cpp line 155](mem_table/mem_table.cpp#L155)). A single integer comparison then orders records correctly — same user key sorts newer sequences first, and a put and a delete for the same key at the same sequence are distinct values. The sequence number is capped at 56 bits (see [mini_kv_store.cpp line 213](db/mini_kv_store.cpp#L213)), giving 72 quadrillion operations before rollover.
 
-**Flush threshold and SST layout.** The MemTable flushes at 4 KB (`mini_kv_store.h:38`), intentionally small so that small test datasets still exercise the flush and compaction paths. Each SST is written in three sequential sections: data blocks (4 KB pages, one sparse index entry per page boundary), an index block listing the first key and offset of each page, and a Bloom filter block. A 16-byte footer closes the file with the byte offsets of those two blocks. The read path therefore only needs to seek twice before reaching the right data block: once to read the footer, once to jump to the target page.
+**WAL lifecycle.** The WAL stays open for the entire database session and is never rotated mid-session. On a clean close, the engine flushes all admitted data to SSTs, publishes the manifest, and truncates the WAL to zero. If the process crashes, recovery reads the WAL, replays every complete record into the active MemTable, and trims any incomplete tail before opening for writes (see [mini_kv_store.cpp lines 26–61](db/mini_kv_store.cpp#L26-L61)). The trade-off is that a very long session accumulates a large WAL, but the recovery path stays simple: there is only one WAL and it either replays cleanly or gets trimmed.
 
-**L0 scan versus L1 binary search.** L0 files can overlap — each flush produces a new file without regard for key ranges already in L0 — so a read must check every L0 file in reverse publication order and stop at the first match or tombstone. L1 files are produced by compaction, which merges all L0 and L1 inputs and sorts the output, so no two L1 files share a key range. A read into L1 uses `upper_bound` on the per-file first keys to find the one candidate file in O(log n) (`mini_kv_store.cpp:162-173`).
+**Flush threshold and SST layout.** The MemTable flushes at 4 KB (see [mini_kv_store.h line 38](db/includes/mini_kv_store.h#L38)), intentionally small so that small test datasets still exercise the flush and compaction paths. Each SST is written in three sequential sections: data blocks (4 KB pages, one sparse index entry per page boundary), an index block listing the first key and offset of each page, and a Bloom filter block. A 16-byte footer closes the file with the byte offsets of those two blocks. The read path therefore only needs to seek twice before reaching the right data block: once to read the footer, once to jump to the target page.
+
+**L0 scan versus L1 binary search.** L0 files can overlap — each flush produces a new file without regard for key ranges already in L0 — so a read must check every L0 file in reverse publication order and stop at the first match or tombstone. L1 files are produced by compaction, which merges all L0 and L1 inputs and sorts the output, so no two L1 files share a key range. A read into L1 uses `upper_bound` on the per-file first keys to find the one candidate file in O(log n) (see [mini_kv_store.cpp lines 162–173](db/mini_kv_store.cpp#L162-L173)).
 
 **Tombstones and compaction scope.** Deleting a key writes a tombstone rather than removing existing data. The tombstone propagates from the MemTable to L0 and then to L1. It is only safe to discard it during a compaction that includes every file that could hold an older version of the same key. Because the current engine runs full L0-to-L1 compaction — all L0 and L1 files participate — it can always discard tombstones at that point. Compaction beyond L1 is not implemented.
 
 **What is left out deliberately.** The engine omits checksums, `fsync` durability, snapshots, range iterators, configurable options, and bounded WAL rotation. These are the features that make a production storage engine substantially more complex. Leaving them out keeps the core LSM data flow — write to WAL, buffer in skip list, flush to SST, compact across levels — legible without the surrounding safety and tunability machinery.
+
+**Performance flamegraph.** The files in `docs/` were captured with `perf record -F 299 -g --call-graph fp` on the benchmark, then processed with FlameGraph. They are historical illustrations — record the source revision, compiler, and machine alongside any result you publish.
+
+[![Flamegraph](docs/flamegraph.png)](docs/flamegraph.svg)
+<sub>Click for the interactive SVG version</sub>
 
 ---
 
@@ -234,5 +249,7 @@ The current API returns an empty string for a missing key, deletion, or stored e
 **Mini-LevelDB** · An educational LSM-tree engine in modern C++
 
 If this project helped you understand how storage engines work, a Star ⭐ is appreciated.
+
+Released under the [MIT License](LICENSE).
 
 </div>

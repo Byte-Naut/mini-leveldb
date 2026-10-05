@@ -72,6 +72,24 @@ Opening a database rebuilds the manifest and caches, restores sequence numbers f
 
 These guarantees cover the tested process-crash scenarios. The implementation uses C++ stream flushing and does not promise power-loss durability through `fsync` or `FlushFileBuffers`. The tests terminate child writers without running destructors, then reopen their files.
 
+## Design notes
+
+These notes explain why the code is shaped the way it is, so the source is easier to follow.
+
+**Skip list for the MemTable.** A skip list sorts records by key and supports forward iteration, which is exactly what the SST flush needs: scan every record in order and write it out. A red-black tree would also work, but skip lists require less implementation machinery — no rotations, and insertion only needs to update a flat array of forward pointers. The level cap is 16 with a 0.25 promotion probability (`mem_table.h:73-74`), which keeps average path length at about log₄(n). Nodes are allocated from a PMR monotonic arena rather than the heap, so the entire MemTable is freed in one call when the table is discarded after a flush.
+
+**Internal key format.** Every record stored in the skip list or an SST carries an internal key: the user key followed by a 64-bit pack value where the upper 56 bits hold the sequence number and the lower 8 bits hold the operation type (`mem_table.cpp:155`). Packing them together means a single integer comparison orders records correctly: same user key sorts newer sequence numbers first, and a put and a delete for the same key at the same sequence are distinct values. The sequence number is capped at 56 bits (`mini_kv_store.cpp:213`), giving 72 quadrillion operations before rollover.
+
+**WAL lifecycle.** The WAL stays open for the entire database session and is never rotated mid-session. On a clean close, the engine flushes all admitted data to SSTs, publishes the manifest, and then truncates the WAL to zero. If the process crashes, recovery reads the WAL, replays every complete record into the active MemTable, and trims any incomplete tail before opening for writes (`mini_kv_store.cpp:26-61`). The trade-off is that a very long session accumulates a large WAL, but the recovery path stays simple: there is only one WAL and it either replays cleanly or gets trimmed.
+
+**Flush threshold and SST layout.** The MemTable flushes at 4 KB (`mini_kv_store.h:38`), which is intentionally small so that small test datasets still exercise the flush and compaction paths. Each SST is written in three sequential sections: data blocks (4 KB pages, one sparse index entry per page boundary), an index block listing the first key and offset of each page, and a Bloom filter block. A 16-byte footer closes the file with the byte offsets of the index and filter blocks. The read path therefore only needs to seek twice before reaching the right data block: once to read the footer, once to jump to the target page.
+
+**L0 scan versus L1 binary search.** L0 files can overlap — each flush produces a new file without regard for key ranges already in L0 — so a read must check every L0 file in reverse publication order (newest first) and stop at the first match or tombstone. L1 files are produced by compaction, which merges all L0 and L1 inputs and sorts the output, so no two L1 files share a key range. A read into L1 therefore uses `upper_bound` on the per-file first keys to find the one candidate file in O(log n) (`mini_kv_store.cpp:162-173`).
+
+**Tombstones and compaction scope.** Deleting a key writes a tombstone record rather than removing existing data. The tombstone propagates from the MemTable to L0 and then to L1. It is only safe to discard a tombstone during a compaction that includes every file that could hold an older version of the same key. Because the current engine runs full L0-to-L1 compaction — all L0 files and all L1 files participate — it can always discard tombstones at that point. Compaction beyond L1 is not implemented.
+
+**What is left out deliberately.** The engine omits checksums, `fsync` durability, snapshots, range iterators, configurable options, and bounded WAL rotation. These are the features that make a production storage engine substantially more complex. Leaving them out keeps the core LSM data flow — write to WAL, buffer in skip list, flush to SST, compact across levels — legible without the surrounding safety and tunability machinery.
+
 ## Verification and CI
 
 CTest registers 16 engine cases: CRUD, disk tombstones, reopen, MemTable flush, compaction, multiple versions, concurrent close/write, WAL replay, process-crash recovery, crash after flush, incomplete WAL tails, versions after reopen, empty keys, all-deleted compaction, concurrent reads during compaction, and I/O failure recovery. Seven cases carry the `integration` label. Tests use independent temporary directories and require successful assertions; they work without GoogleTest or network downloads.

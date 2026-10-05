@@ -76,9 +76,9 @@ private:
     void internal_put(std::string_view, uint64_t, OperationType, std::string_view); // 插入节点
 
     // --- 随机数生成 ---
-    inline static std::mt19937 eng_{std::random_device{}()}; // 随机数生成引擎：MT19937
-    inline static std::uniform_int_distribution<> dist_{0, 10}; // 随机数分布：均匀分布
-    inline static double get_random(); // 生成随机概率值
+    std::mt19937 eng_{std::random_device{}()}; // 每个内存表独立的随机数引擎
+    std::uniform_int_distribution<> dist_{0, 10};
+    double get_random();
 
     // --- 内存管理 ---
     std::pmr::monotonic_buffer_resource arena_ {1024 * 1024}; // 内存池

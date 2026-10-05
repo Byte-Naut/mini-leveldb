@@ -11,6 +11,8 @@
 #include <cstring> // 为后续的内存字节流解码提供 memcpy
 #include <list>
 #include <mutex>
+#include <thread>
+#include <exception>
 
 #include "../../mem_table/includes/mem_table.h"
 
@@ -21,10 +23,13 @@ class mini_kv_store
 public:
     mini_kv_store();
     ~mini_kv_store();
+    void close();
     [[nodiscard]] std::string get(std::string_view) const;
     void put(std::string_view, std::string_view);
     void erase(std::string_view);
 private:
+    mutable std::shared_mutex lifecycle_mutex_;
+    bool closed_ = false;
     // --- 活跃内存跳表 ---
     mutable std::shared_mutex rw_mutex; // 内存跳表读写锁
 
@@ -78,6 +83,7 @@ private:
     void background_compaction_routine(); // 落盘调度函数
     std::thread bg_thread_; // 落盘线程
     std::atomic<bool> stop_bg_thread_{false}; // 线程间通信-停机标志位
+    std::exception_ptr bg_error_;
     void flush_imm_to_sstable(const std::shared_ptr<mem_table>&); // 落盘函数
     class sst_scanner // sst记录读取器
     {

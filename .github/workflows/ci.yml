@@ -1,0 +1,49 @@
+name: CI
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC
+            cc: gcc
+            cxx: g++
+            sanitizers: 'OFF'
+          - name: Clang
+            cc: clang
+            cxx: clang++
+            sanitizers: 'OFF'
+          - name: ASan-UBSan
+            cc: clang
+            cxx: clang++
+            sanitizers: 'ON'
+    name: ${{ matrix.name }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMINI_LEVELDB_SANITIZERS=${{ matrix.sanitizers }}
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --output-junit results.xml
+      - name: Demo and benchmark correctness
+        run: |
+          ./build/mini_leveldb_demo "$RUNNER_TEMP/demo"
+          ./build/mini_kv_bench --correctness
+      - name: Install
+        run: cmake --install build --prefix "$RUNNER_TEMP/mini-leveldb"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.name }}
+          path: |
+            build/results.xml
+            build/Testing/Temporary/LastTest.log

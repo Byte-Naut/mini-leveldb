@@ -4,6 +4,15 @@
 #include <queue>
 #include <ranges>
 #include <algorithm>
+#include <stdexcept>
+#include <limits>
+#include <array>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "includes/mini_kv_store.h"
 #include "../mem_table/includes/mem_table.h"
@@ -11,64 +20,45 @@
 
 mini_kv_store::mini_kv_store(): levels_(7)
 {
-    // 在 WAL 回放前重建历史拓扑
     load_manifest_and_rebuild_cache();
-
-    // 1. 探测物理日志残留，建立只读回放管线
-    if (const std::string wal_path = "wal.log"; std::filesystem::exists(wal_path))
+    const std::string wal_path = "wal.log";
+    if (std::filesystem::exists(wal_path))
     {
         std::ifstream wal_in(wal_path, std::ios::binary);
-        if (wal_in.is_open())
+        if (!wal_in) throw std::runtime_error("Cannot open WAL for recovery");
+        const uint64_t wal_size = std::filesystem::file_size(wal_path);
+        uint64_t valid_size = 0;
+        while (valid_size < wal_size)
         {
-            uint8_t t_raw;
-            uint64_t seq{0};
-
-            while (coding::read_raw(wal_in, t_raw))
-            {
-                uint32_t k_size, v_size;
-                std::string key, value;
-
-                coding::read_raw(wal_in, seq);
-                coding::read_raw(wal_in, k_size);
-                key = coding::read_slice(wal_in, k_size);
-
-                coding::read_raw(wal_in, v_size);
-                value = coding::read_slice(wal_in, v_size);
-
-                // 3. 物理回放：绕过并发锁，直插底层跳表
-                if (const auto type = static_cast<OperationType>(t_raw); type == OperationType::kValue)
-                {
-                    data_ -> insert_record(key, seq, value);
-                }
-                else
-                {
-                    data_ -> insert_tombstone(key, seq);
-                }
-            }
-
-            // 4. 同步抬升全局序列号的水位线
+            const uint64_t remaining = wal_size - valid_size;
+            constexpr uint64_t fixed_bytes = sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t);
+            if (remaining < fixed_bytes) break;
+            uint8_t type_raw = 0;
+            uint64_t seq = 0;
+            uint32_t key_size = 0, value_size = 0;
+            if (!coding::read_raw(wal_in, type_raw) ||
+                !coding::read_raw(wal_in, seq) ||
+                !coding::read_raw(wal_in, key_size)) break;
+            uint64_t consumed = sizeof(type_raw) + sizeof(seq) + sizeof(key_size);
+            if (key_size > remaining - consumed - sizeof(value_size)) break;
+            std::string key = coding::read_slice(wal_in, key_size);
+            if (!wal_in || !coding::read_raw(wal_in, value_size)) break;
+            consumed += key_size + sizeof(value_size);
+            if (value_size > remaining - consumed) break;
+            std::string value = coding::read_slice(wal_in, value_size);
+            if (!wal_in || (type_raw != static_cast<uint8_t>(OperationType::kValue) &&
+                            type_raw != static_cast<uint8_t>(OperationType::kDeletion))) break;
+            if (type_raw == static_cast<uint8_t>(OperationType::kValue))
+                data_->insert_record(key, seq, value);
+            else
+                data_->insert_tombstone(key, seq);
             if (seq >= current_seq_.load(std::memory_order_relaxed))
-            {
                 current_seq_.store(seq + 1, std::memory_order_relaxed);
-            }
-            if (data_->approximate_memory_usage() >= memtable_size_threshold_)
-            {
-                {
-                    std::lock_guard bg_lock(bg_mutex_);
-                    bg_queue_.push_back(std::move(data_));
-                    data_ = std::make_shared<mem_table>();
-                }
-                bg_cv_.notify_one();
-
-                wal_file_.close();
-                wal_file_.open("wal.log", std::ios::out | std::ios::binary | std::ios::trunc);
-            }
-            wal_in.close();
+            valid_size += consumed + value_size;
         }
-
+        wal_in.close();
+        if (valid_size != wal_size) std::filesystem::resize_file(wal_path, valid_size);
     }
-
-    // 5. 回放完毕，建立全新的追加写入管线
     wal_file_.open("wal.log", std::ios::app | std::ios::binary);
     if (!wal_file_.is_open())
     {
@@ -80,27 +70,46 @@ mini_kv_store::mini_kv_store(): levels_(7)
 
 mini_kv_store::~mini_kv_store()
 {
+    try { close(); } catch (...) { /* WAL remains available for recovery. */ }
+}
+
+void mini_kv_store::close()
+{
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
+    if (closed_) return;
+    if (data_->approximate_memory_usage() != 0)
     {
         std::lock_guard lock(bg_mutex_);
-        stop_bg_thread_ = true; // 拨动物理销毁开关
+        bg_queue_.push_back(data_);
+        data_.reset();
     }
-    bg_cv_.notify_all(); // 发送全频段唤醒脉冲
-    if (bg_thread_.joinable())
+    closed_ = true;
     {
-        bg_thread_.join(); // 强制阻塞主线程，等待后台队列彻底排空并物理停机
+        std::lock_guard lock(bg_mutex_);
+        stop_bg_thread_ = true;
     }
+    bg_cv_.notify_all();
+    if (bg_thread_.joinable()) bg_thread_.join();
     {
         std::lock_guard wal_lock(wal_mutex_);
         if (wal_file_.is_open())
         {
             wal_file_.flush();
+            if (!wal_file_) throw std::runtime_error("Cannot flush WAL during close");
             wal_file_.close();
         }
     }
+    if (bg_error_) std::rethrow_exception(bg_error_);
+    std::ofstream clear_wal("wal.log", std::ios::binary | std::ios::trunc);
+    if (!clear_wal) throw std::runtime_error("Cannot truncate committed WAL");
+    clear_wal.close();
+    if (!clear_wal) throw std::runtime_error("Cannot close committed WAL");
 }
 
 std::string mini_kv_store::get(const std::string_view key) const
 {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (closed_) throw std::runtime_error("Store is closed");
     // 穿透层级1：观测最高频的活跃内存表（Active MemTable）
     {
         // 构造期获取共享锁，析构期自动释放
@@ -123,18 +132,19 @@ std::string mini_kv_store::get(const std::string_view key) const
     } // 释放 bg_mutex_
 
     // 穿透层级 3：多维物理矩阵级联检索
-    std::vector <std::vector<uint64_t>> current_matrix;
-    {
-        std::shared_lock manifest_lock(manifest_mutex_);
-        current_matrix = levels_;
-    }
+    // Keep source files alive until the lookup finishes; compaction unlinks them
+    // only while holding the exclusive manifest lock.
+    std::shared_lock manifest_lock(manifest_mutex_);
+    const auto& current_matrix = levels_;
 
     // 绝对偏序 1：Level 0 具有最高时间权重，需逆向遍历内部文件
     for (const auto id : std::ranges::reverse_view(current_matrix[0]))
     {
         if (!may_exist_in_sst(id, key)) continue; // L0 也可应用布隆拦截
-        if (auto [status, value] = search_in_sstable(key, id); status == SearchStatus::kFoundValue)
-            return value;
+        auto disk_result = search_in_sstable(key, id);
+        if (disk_result.status == SearchStatus::FNotOpen) throw std::runtime_error("Cannot read referenced SST");
+        if (disk_result.status == SearchStatus::kFoundValue) return disk_result.value;
+        if (disk_result.status == SearchStatus::kFoundDeletion) return "";
     }
 
     // 绝对偏序 2：Level 1 至 Level N，数据绝对互斥且全局有序，执行文件级 O(log N) 二分深潜
@@ -152,6 +162,7 @@ std::string mini_kv_store::get(const std::string_view key) const
             auto it = std::upper_bound(current_level_files.begin(), current_level_files.end(), key,
                 [this](const std::string_view k, const uint64_t id)
                 {
+                    if (index_cache_.at(id).empty()) return false;
                     return k < index_cache_.at(id).front().key;
                 });
             // 回退一个身位，锁定唯一可能包含目标数据的物理文件
@@ -169,8 +180,10 @@ std::string mini_kv_store::get(const std::string_view key) const
             // 内存断路器：阻断无效物理磁盘下潜
             if (!may_exist_in_sst(target_sst_id, key)) continue;
 
-            if (auto disk_result = search_in_sstable(key, target_sst_id); disk_result.status == SearchStatus::kFoundValue)
-                return disk_result.value;
+            auto disk_result = search_in_sstable(key, target_sst_id);
+            if (disk_result.status == SearchStatus::FNotOpen) throw std::runtime_error("Cannot read referenced SST");
+            if (disk_result.status == SearchStatus::kFoundValue) return disk_result.value;
+            if (disk_result.status == SearchStatus::kFoundDeletion) return "";
         }
     }
 
@@ -179,6 +192,8 @@ std::string mini_kv_store::get(const std::string_view key) const
 
 void mini_kv_store::put(const std::string_view key, std::string_view value)
 {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (closed_) throw std::runtime_error("Store is closed");
     // 构造期获取排他锁，执行物理清场
     std::unique_lock lock(rw_mutex);
 
@@ -204,8 +219,20 @@ void mini_kv_store::put(const std::string_view key, std::string_view value)
 
 void mini_kv_store::erase(const std::string_view key)
 {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (closed_) throw std::runtime_error("Store is closed");
     // 构造期获取排他锁，执行物理清场
     std::unique_lock lock(rw_mutex);
+    if (data_->approximate_memory_usage() >= memtable_size_threshold_)
+    {
+        auto replacement = std::make_shared<mem_table>();
+        {
+            std::lock_guard bg_lock(bg_mutex_);
+            bg_queue_.push_back(data_);
+            data_ = std::move(replacement);
+        }
+        bg_cv_.notify_one();
+    }
     const uint64_t seq = current_seq_.fetch_add(1, std::memory_order_relaxed) & 0x00FFFFFFFFFFFFFF;
     // 物理防线：先落盘，删除操作的 value 设为空
     append_to_wal(OperationType::kDeletion, seq, key, "");
@@ -231,6 +258,7 @@ void mini_kv_store::append_to_wal(OperationType type, uint64_t seq, const std::s
     coding::write_slice(wal_file_, value);
 
     wal_file_.flush();
+    if (!wal_file_) throw std::runtime_error("WAL append failed");
 }
 
 void mini_kv_store::background_compaction_routine()
@@ -255,7 +283,16 @@ void mini_kv_store::background_compaction_routine()
         } // 离开作用域，瞬间释放 bg_mutex_
 
         // 绝对算力解耦：在此处执行耗时数百毫秒的磁盘操作.彻底远离主线程 rw_mutex_ 与 bg_mutex_，无阻力落盘
-        flush_imm_to_sstable(imm_to_flush);
+        try
+        {
+            flush_imm_to_sstable(imm_to_flush);
+        }
+        catch (...)
+        {
+            std::lock_guard lock(bg_mutex_);
+            bg_error_ = std::current_exception();
+            return;
+        }
 
         // 磁盘刻录完成，数据已在SSTable中绝对可见 此时方可获取锁，将跳表从内存观测队列中物理剥离
         {
@@ -263,15 +300,13 @@ void mini_kv_store::background_compaction_routine()
             bg_queue_.pop_front();
         }
 
-        // 截断 WAL 历史刻痕，防止回放风暴
+        try { compact_level0_to_level1(); }
+        catch (...)
         {
-            std::lock_guard wal_lock(wal_mutex_);
-            wal_file_.close();
-            wal_file_.open("wal.log", std::ios::out | std::ios::binary | std::ios::trunc); // 截断 (trunc) 模式：清空旧日志，因为旧数据已移交后台落盘队列
+            std::lock_guard lock(bg_mutex_);
+            bg_error_ = std::current_exception();
+            return;
         }
-
-        // 注入阶段二管线：检查是否需要执行物理压实
-        compact_level0_to_level1();
     }
 }
 
@@ -282,12 +317,14 @@ void mini_kv_store::flush_imm_to_sstable(const std::shared_ptr<mem_table>& imm_t
     std::string sst_path = generate_sst_filename(sst_id);
 
     std::ofstream sst_file(sst_path, std::ios::binary | std::ios::trunc);
-    if (!sst_file.is_open()) return;
+    if (!sst_file.is_open()) throw std::runtime_error("Cannot open SST for flush");
 
     std::vector<index_record> sparse_index;
 
     uint64_t current_offset = 0;
     uint64_t last_block_offset = 0;
+    std::string previous_key;
+    bool have_previous_key = false;
 
     std::vector<std::string> all_keys_for_bloom;
 
@@ -299,7 +336,9 @@ void mini_kv_store::flush_imm_to_sstable(const std::shared_ptr<mem_table>& imm_t
 
         auto raw_payload = it.raw_payload();
 
-        if (constexpr uint64_t PAGE_SIZE = 4096; current_offset - last_block_offset >= PAGE_SIZE || current_offset == 0)
+        if (constexpr uint64_t PAGE_SIZE = 4096;
+            (current_offset - last_block_offset >= PAGE_SIZE || current_offset == 0) &&
+            (!have_previous_key || view.key != previous_key))
         {
             sparse_index.emplace_back(std::string(view.key), current_offset);
             last_block_offset = current_offset;
@@ -307,6 +346,8 @@ void mini_kv_store::flush_imm_to_sstable(const std::shared_ptr<mem_table>& imm_t
 
         coding::write_buffer(sst_file, raw_payload);
         current_offset += raw_payload.size();
+        previous_key = view.key;
+        have_previous_key = true;
     }
 
     // 2. 顺序蚀刻索引块（Index Block）
@@ -330,7 +371,9 @@ void mini_kv_store::flush_imm_to_sstable(const std::shared_ptr<mem_table>& imm_t
     coding::write_raw(sst_file, bloom_block_offset);
 
     sst_file.flush();
+    if (!sst_file) throw std::runtime_error("Cannot write SST during flush");
     sst_file.close();
+    if (!sst_file) throw std::runtime_error("Cannot close SST after flush");
 
     // 拓扑更新：将新生效的位图直插内存缓存网
     {
@@ -343,7 +386,8 @@ void mini_kv_store::flush_imm_to_sstable(const std::shared_ptr<mem_table>& imm_t
     {
         std::unique_lock manifest_lock(manifest_mutex_);
         levels_[0].push_back(sst_id);
-        save_manifest();
+        try { save_manifest(); }
+        catch (...) { levels_[0].pop_back(); throw; }
     }
 }
 
@@ -368,7 +412,10 @@ mini_kv_store::sst_scanner::sst_scanner(const std::string_view path)
 
 bool mini_kv_store::sst_scanner::has_next()
 {
-    return file_.is_open() && file_.tellg() < index_offset_;
+    if (!file_.is_open()) return false;
+    const auto position = file_.tellg();
+    return position != std::streampos(-1) &&
+           static_cast<uint64_t>(static_cast<std::streamoff>(position)) < index_offset_;
 }
 
 ParsedRecord mini_kv_store::sst_scanner::next()
@@ -423,6 +470,7 @@ void mini_kv_store::compact_level0_to_level1()
     // 3. 开启全新物理文件管道承接压缩后的数据
     std::string new_sst_path = generate_sst_filename(new_sst_id);
     std::ofstream new_sst_file(new_sst_path, std::ios::binary | std::ios::trunc);
+    if (!new_sst_file) throw std::runtime_error("Cannot open compaction SST");
     std::vector<index_record> sparse_index;
 
     uint64_t current_offset = 0;
@@ -444,15 +492,17 @@ void mini_kv_store::compact_level0_to_level1()
 
         // 4. 执行 K 路流式归并（不消耗额外内存）
         std::string last_key;
+        bool have_last_key = false;
         uint64_t last_block_offset = 0;
         while (!min_heap.empty())
         {
             HeapNode top = min_heap.top();
             min_heap.pop();
             // 物理降噪：剔除旧版本数据（同一 Key 仅保留第一次弹出的最新 Seq）
-            if (top.record.key != last_key)
+            if (!have_last_key || top.record.key != last_key)
             {
                 last_key = top.record.key;
+                have_last_key = true;
 
                 // 物理降噪：彻底丢弃物理墓碑，回收磁盘空间
                 if (top.record.type != OperationType::kDeletion)
@@ -505,7 +555,10 @@ void mini_kv_store::compact_level0_to_level1()
     coding::write_raw(new_sst_file, index_block_offset);
     coding::write_raw(new_sst_file, bloom_block_offset);
     new_sst_file.flush();
+    if (!new_sst_file) throw std::runtime_error("Cannot write compaction SST");
     new_sst_file.close();
+    if (!new_sst_file) throw std::runtime_error("Cannot close compaction SST");
+    const bool has_compacted_records = !sparse_index.empty();
 
     // 拓扑更新：将新生效的位图直插内存缓存网
     {
@@ -521,19 +574,23 @@ void mini_kv_store::compact_level0_to_level1()
         levels_[0].clear();
         levels_[1].clear();
         // 新文件直接沉降至 Level 1 矩阵
-        levels_[1].push_back(new_sst_id);
-        save_manifest();
-    }
-
-    // 像操作系统发送 'unlink' 系统调用，物理销毁旧文件
-    for (uint64_t old_id : all_files)
-    {
-
-        if (std::remove(generate_sst_filename(old_id).c_str()) != 0)
+        if (has_compacted_records) levels_[1].push_back(new_sst_id);
+        try { save_manifest(); }
+        catch (...)
         {
-            perror("Error deleting file"); // 打印类似 "Permission denied" 或 "No such file"
+            levels_[0] = target_l0;
+            levels_[1] = target_l1;
+            throw;
+        }
+        // Readers hold the shared manifest lock across disk access, so old
+        // files can be unlinked only while this exclusive lock is held.
+        for (uint64_t old_id : all_files)
+        {
+            if (std::remove(generate_sst_filename(old_id).c_str()) != 0)
+                perror("Error deleting file");
         }
     }
+    if (!has_compacted_records) std::remove(new_sst_path.c_str());
 }
 
 std::string mini_kv_store::generate_sst_filename(uint64_t id) const
@@ -550,7 +607,7 @@ void mini_kv_store::save_manifest() const
     const std::string real_manifest = "MANIFEST";
 
     std::ofstream out(tmp_manifest, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) return;
+    if (!out.is_open()) throw std::runtime_error("Cannot open MANIFEST.tmp");
 
     // 1. 固化全局文件序列号
     const uint64_t current_id = next_sst_id_.load(std::memory_order_relaxed);
@@ -571,10 +628,20 @@ void mini_kv_store::save_manifest() const
     }
 
     out.flush();
+    if (!out) throw std::runtime_error("Cannot write MANIFEST");
     out.close();
+    if (!out) throw std::runtime_error("Cannot close MANIFEST");
 
     // 3. 操作系统级原子替换：强制确保文件系统的绝对一致性
+#ifdef _WIN32
+    const auto source = std::filesystem::path(tmp_manifest).wstring();
+    const auto target = std::filesystem::path(real_manifest).wstring();
+    if (!MoveFileExW(source.c_str(), target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw std::runtime_error("Cannot replace MANIFEST");
+#else
     std::filesystem::rename(tmp_manifest, real_manifest);
+#endif
 }
 
 void mini_kv_store::load_manifest_and_rebuild_cache()
@@ -614,16 +681,18 @@ void mini_kv_store::load_manifest_and_rebuild_cache()
         {
             std::string sst_path = generate_sst_filename(sst_id);
             std::ifstream sst_file(sst_path, std::ios::binary | std::ios::ate);
-            if (!sst_file.is_open()) continue;
+            if (!sst_file.is_open()) throw std::runtime_error("MANIFEST references missing SST");
 
             uint64_t file_size = sst_file.tellg();
-            if (file_size < 16) continue; // 文件尺寸异常
+            if (file_size < 16) throw std::runtime_error("MANIFEST references truncated SST");
 
             // 读取 16 字节 Footer
             sst_file.seekg(-16, std::ios::end);
             uint64_t index_offset, bloom_offset;
             coding::read_raw(sst_file, index_offset);
             coding::read_raw(sst_file, bloom_offset);
+            if (!sst_file || index_offset > bloom_offset || bloom_offset > file_size - 16)
+                throw std::runtime_error("Invalid SST footer");
 
             // 计算位图物理体积并抽离至内存
             uint64_t bloom_size = (file_size - 16) - bloom_offset;
@@ -638,18 +707,29 @@ void mini_kv_store::load_manifest_and_rebuild_cache()
             sst_file.seekg(index_offset, std::ios::beg);
             std::vector<index_record> sparse_index;
             // 索引块的绝对终点即为布隆块的起点（bloom_offset）
-            while (sst_file.tellg() < bloom_offset)
+            while (true)
             {
+                const auto position = sst_file.tellg();
+                if (position == std::streampos(-1)) throw std::runtime_error("Invalid SST index");
+                if (static_cast<uint64_t>(static_cast<std::streamoff>(position)) >= bloom_offset) break;
                 uint32_t k_size;
-                coding::read_raw(sst_file, k_size);
+                if (!coding::read_raw(sst_file, k_size)) throw std::runtime_error("Invalid SST index");
                 std::string idx_key = coding::read_slice(sst_file, k_size);
 
                 uint64_t block_offset;
-                coding::read_raw(sst_file, block_offset);
+                if (!sst_file || !coding::read_raw(sst_file, block_offset))
+                    throw std::runtime_error("Invalid SST index");
 
                 sparse_index.emplace_back(std::move(idx_key), block_offset);
             }
             index_cache_[sst_id] = std::move(sparse_index);
+            sst_scanner scanner(sst_path);
+            while (scanner.has_next())
+            {
+                const auto record = scanner.next();
+                if (record.seq >= current_seq_.load(std::memory_order_relaxed))
+                    current_seq_.store(record.seq + 1, std::memory_order_relaxed);
+            }
         }
     }
 }
@@ -730,7 +810,8 @@ std::shared_ptr<const std::vector<std::byte>> mini_kv_store::fetch_block(const u
     const uint64_t block_size = next_offset - block_offset;
     std::vector<std::byte> block_data(block_size);
     sst_file.seekg(block_offset, std::ios::beg);
-    coding::read_buffer(sst_file, std::span{block_data});
+    if (!coding::read_buffer(sst_file, std::span{block_data}))
+        throw std::runtime_error("Cannot read SST block");
     sst_file.close();
     // 将新数据块锚定至LRU队列与map
     std::shared_ptr<lru_cache::block_elem> new_elem;
@@ -762,46 +843,46 @@ SearchResult mini_kv_store::search_in_sstable(const std::string_view key, const 
     if (!sst_file.is_open()) return {SearchStatus::FNotOpen, ""};
 
     // --- 利用稀疏索引缓存查找key所在块 ---
-    uint64_t target_block_offset = 0;
-    uint64_t next_block_offset = 0;
+    std::array<std::pair<uint64_t, uint64_t>, 2> candidate_blocks{};
+    size_t candidate_count = 0;
     {
         std::shared_lock lock(cache_mutex_);
         const auto& sparse_index = index_cache_.at(sst_id);
-        auto it_next = std::upper_bound(sparse_index.begin(), sparse_index.end(), key,
-            [](const std::string_view k, const index_record& elem)
+        if (sparse_index.empty()) return {SearchStatus::kNotFound, ""};
+        auto first_ge = std::lower_bound(sparse_index.begin(), sparse_index.end(), key,
+            [](const index_record& elem, const std::string_view k)
             {
-                return k < elem.key;
+                return elem.key < k;
             });
-        if (it_next == sparse_index.begin())
+        if (first_ge == sparse_index.begin() && first_ge->key > key)
+            return {SearchStatus::kNotFound, ""};
+        size_t first_index = first_ge == sparse_index.begin() ? 0 :
+                             static_cast<size_t>(first_ge - sparse_index.begin() - 1);
+        if (first_ge == sparse_index.end()) first_index = sparse_index.size() - 1;
+        const bool check_equal_block = first_ge != sparse_index.end() &&
+                                       first_ge != sparse_index.begin() && first_ge->key == key;
+        sst_file.seekg(-static_cast<std::streamoff>(sizeof(uint64_t) * 2), std::ios::end);
+        uint64_t data_end = 0;
+        if (!coding::read_raw(sst_file, data_end)) throw std::runtime_error("Invalid SST footer");
+        auto add_block = [&](size_t index)
         {
-            return {SearchStatus::kNotFound, ""}; // 未找到
-        }
-        if (it_next != sparse_index.end()) // 若当前块不是稀疏索引中的最后一块，则下一块的起点即为当前块的终点
-        {
-            next_block_offset = it_next->offset;
-        }
-        else
-        {
-            sst_file.seekg(-static_cast<std::streamoff>(sizeof(uint64_t) * 2), std::ios::end);
-            uint64_t index_offset = 0;
-            coding::read_raw(sst_file, index_offset);
-            next_block_offset = index_offset;
-        }
-        target_block_offset = (--it_next)->offset;
+            const uint64_t end = index + 1 < sparse_index.size() ? sparse_index[index + 1].offset : data_end;
+            candidate_blocks[candidate_count++] = {sparse_index[index].offset, end};
+        };
+        add_block(first_index);
+        if (check_equal_block) add_block(first_index + 1);
     }
 
-    // --- 获取块，依次尝试 LRU Cache 与 I/0 ---
-    auto block_data_ptr = fetch_block(sst_id, target_block_offset, next_block_offset);
-    if (!block_data_ptr)
+    for (size_t candidate = 0; candidate < candidate_count; ++candidate)
     {
-        return {SearchStatus::FNotOpen, ""};
-    }
+        const auto [target_block_offset, next_block_offset] = candidate_blocks[candidate];
+        auto block_data_ptr = fetch_block(sst_id, target_block_offset, next_block_offset);
+        if (!block_data_ptr) return {SearchStatus::FNotOpen, ""};
 
-    // --- 内存中串行解码块内容，找key对应值 ---
-    size_t offset = 0;
-    std::span buffer{*block_data_ptr}; // TODO 统一抽象
-    while (offset < buffer.size())
-    {
+        size_t offset = 0;
+        std::span buffer{*block_data_ptr};
+        while (offset < buffer.size())
+        {
         const auto internal_key_size = coding::decode_fixed<uint32_t>(buffer.subspan(offset).first<sizeof(uint32_t)>());
         offset += sizeof(internal_key_size);
 
@@ -834,7 +915,8 @@ SearchResult mini_kv_store::search_in_sstable(const std::string_view key, const 
         }
 
         // 数据块本身是有序的，一旦跨越目标范围即可提前停机
-        if (current_key.compare(key) > 0) break;
+            if (current_key.compare(key) > 0) break;
+        }
     }
 
     return {SearchStatus::kNotFound, ""};
